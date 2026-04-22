@@ -1,107 +1,55 @@
 import { Router } from 'express';
-import {
-  getOpenProjects,
-  getProjectTasks,
-  getOpenQuotations,
-  getUnpaidInvoices,
-  getOpenIssues,
-  getERPSnapshot,
-} from '../tools/frappe.js';
+import { getERPSnapshot, fetchOne, DOCTYPE_REGISTRY } from '../tools/frappe.js';
 import * as backend from '../lib/backendClient.js';
 
 const router = Router();
 
+// Helper — resolves a task manager project to its connection ID
+async function resolveConnection(projectId) {
+  const projects = await backend.getProjects();
+  const project  = projects.find(p => p.id === projectId);
+  if (!project)       throw Object.assign(new Error('Project not found'), { status: 404 });
+  if (!project.connId) throw Object.assign(new Error('Project has no connection configured'), { status: 400 });
+  return { project, connId: project.connId };
+}
+
+/**
+ * GET /erp/registry
+ * Returns the list of registered doctypes — useful for the frontend
+ * to know what it can query, including any custom ones.
+ */
+router.get('/registry', (req, res) => {
+  res.json(DOCTYPE_REGISTRY.map(e => ({ id: e.id, label: e.label, doctype: e.doctype })));
+});
+
 /**
  * GET /erp/snapshot/:projectId
- *
- * Returns the full ERP snapshot for a given project's connection.
- * Used by the frontend to show live ERP data alongside tasks.
+ * Full snapshot across all registered doctypes for a project's connection.
  */
 router.get('/snapshot/:projectId', async (req, res) => {
   try {
-    const projects = await backend.getProjects();
-    const project  = projects.find(p => p.id === req.params.projectId);
-    if (!project) return res.status(404).json({ error: 'Project not found' });
-    if (!project.connId) return res.json({ stub: true, message: 'Project has no connection configured.' });
-
-    const snapshot = await getERPSnapshot(project.connId);
+    const { project, connId } = await resolveConnection(req.params.projectId);
+    const snapshot = await getERPSnapshot(connId);
     res.json({ project: project.name, ...snapshot });
   } catch (err) {
-    console.error('[erp/snapshot]', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
 /**
- * GET /erp/projects/:projectId
- * Returns open ERP projects for a given task manager project's connection.
+ * GET /erp/:projectId/:doctypeId
+ * Fetch a single doctype by its registry id for a project.
+ * e.g. GET /erp/proj_123/quotations
+ *      GET /erp/proj_123/sales_orders
+ *      GET /erp/proj_123/my_custom_doc  ← works automatically once added to registry
  */
-router.get('/projects/:projectId', async (req, res) => {
+router.get('/:projectId/:doctypeId', async (req, res) => {
   try {
-    const projects = await backend.getProjects();
-    const project  = projects.find(p => p.id === req.params.projectId);
-    if (!project?.connId) return res.json({ stub: true, message: 'No connection configured.' });
-    res.json(await getOpenProjects(project.connId));
+    const { connId } = await resolveConnection(req.params.projectId);
+    const result     = await fetchOne(connId, req.params.doctypeId);
+    res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * GET /erp/tasks/:projectId
- * Returns open ERP tasks for a given task manager project's connection.
- */
-router.get('/tasks/:projectId', async (req, res) => {
-  try {
-    const projects   = await backend.getProjects();
-    const project    = projects.find(p => p.id === req.params.projectId);
-    if (!project?.connId) return res.json({ stub: true, message: 'No connection configured.' });
-    const erpProject = req.query.erp_project || null;
-    res.json(await getProjectTasks(project.connId, erpProject));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * GET /erp/quotations/:projectId
- */
-router.get('/quotations/:projectId', async (req, res) => {
-  try {
-    const projects = await backend.getProjects();
-    const project  = projects.find(p => p.id === req.params.projectId);
-    if (!project?.connId) return res.json({ stub: true, message: 'No connection configured.' });
-    res.json(await getOpenQuotations(project.connId));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * GET /erp/invoices/:projectId
- */
-router.get('/invoices/:projectId', async (req, res) => {
-  try {
-    const projects = await backend.getProjects();
-    const project  = projects.find(p => p.id === req.params.projectId);
-    if (!project?.connId) return res.json({ stub: true, message: 'No connection configured.' });
-    res.json(await getUnpaidInvoices(project.connId));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * GET /erp/issues/:projectId
- */
-router.get('/issues/:projectId', async (req, res) => {
-  try {
-    const projects = await backend.getProjects();
-    const project  = projects.find(p => p.id === req.params.projectId);
-    if (!project?.connId) return res.json({ stub: true, message: 'No connection configured.' });
-    res.json(await getOpenIssues(project.connId));
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 

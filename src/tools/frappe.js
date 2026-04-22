@@ -4,22 +4,107 @@ import * as backend from '../lib/backendClient.js';
 /**
  * Frappe/ERPNext connector.
  * Credentials are loaded from the connection registry (not hardcoded).
- * When a connection has status = 'configured', real API calls are made.
- * When unconfigured, a clear stub response is returned instead of failing.
+ * Doctypes to fetch are driven by a configurable registry below —
+ * add custom doctypes without touching any other file.
  */
 
-// ── Load connection config from the registry ──────────────────────────────────
+// ── Doctype registry ──────────────────────────────────────────────────────────
+// Each entry defines how to fetch and display a Frappe doctype.
+// To add a custom doctype: append an entry to this array.
+// Fields must exist on the doctype — check your Frappe instance if unsure.
+//
+// Standard filter values reference:
+//   docstatus: 0=Draft, 1=Submitted, 2=Cancelled
+//   status: varies per doctype
+
+export const DOCTYPE_REGISTRY = [
+  {
+    id:       'quotations',
+    label:    'Quotations',
+    doctype:  'Quotation',
+    filters:  [['docstatus', '=', 1], ['status', 'not in', ['Ordered', 'Cancelled', 'Lost']]],
+    fields:   ['name', 'party_name', 'transaction_date', 'valid_till', 'grand_total', 'currency', 'status'],
+    display:  (r) => `${r.party_name} · ${r.grand_total} ${r.currency} · ${r.status}${r.valid_till ? ' · valid till ' + r.valid_till : ''}`,
+  },
+  {
+    id:       'sales_orders',
+    label:    'Sales Orders',
+    doctype:  'Sales Order',
+    filters:  [['docstatus', '=', 1], ['status', 'not in', ['Completed', 'Cancelled', 'Closed']]],
+    fields:   ['name', 'customer', 'transaction_date', 'delivery_date', 'grand_total', 'currency', 'status', 'per_delivered', 'per_billed'],
+    display:  (r) => `${r.customer} · ${r.grand_total} ${r.currency} · ${r.status} · delivered ${r.per_delivered || 0}% · billed ${r.per_billed || 0}%`,
+  },
+  {
+    id:       'purchase_orders',
+    label:    'Purchase Orders',
+    doctype:  'Purchase Order',
+    filters:  [['docstatus', '=', 1], ['status', 'not in', ['Completed', 'Cancelled', 'Closed']]],
+    fields:   ['name', 'supplier', 'transaction_date', 'schedule_date', 'grand_total', 'currency', 'status', 'per_received', 'per_billed'],
+    display:  (r) => `${r.supplier} · ${r.grand_total} ${r.currency} · ${r.status}${r.schedule_date ? ' · due ' + r.schedule_date : ''}`,
+  },
+  {
+    id:       'sales_invoices',
+    label:    'Unpaid Sales Invoices',
+    doctype:  'Sales Invoice',
+    filters:  [['docstatus', '=', 1], ['outstanding_amount', '>', 0]],
+    fields:   ['name', 'customer', 'posting_date', 'due_date', 'grand_total', 'outstanding_amount', 'currency'],
+    display:  (r) => `${r.customer} · outstanding ${r.outstanding_amount} ${r.currency}${r.due_date ? ' · due ' + r.due_date : ''}`,
+  },
+  {
+    id:       'issues',
+    label:    'Open Issues',
+    doctype:  'Issue',
+    filters:  [['status', 'not in', ['Resolved', 'Closed']]],
+    fields:   ['name', 'subject', 'customer', 'status', 'priority', 'opening_date'],
+    display:  (r) => `[${r.priority || 'Medium'}] ${r.subject}${r.customer ? ' · ' + r.customer : ''}`,
+  },
+  {
+    id:       'delivery_notes',
+    label:    'Open Delivery Notes',
+    doctype:  'Delivery Note',
+    filters:  [['docstatus', '=', 1], ['status', 'not in', ['Completed', 'Cancelled', 'Closed']]],
+    fields:   ['name', 'customer', 'posting_date', 'grand_total', 'currency', 'status', 'per_installed'],
+    display:  (r) => `${r.customer} · ${r.grand_total} ${r.currency} · ${r.status}`,
+  },
+  {
+    id:       'payment_entries',
+    label:    'Recent Payment Entries',
+    doctype:  'Payment Entry',
+    filters:  [['docstatus', '=', 1], ['posting_date', '>=', relativeDate(-30)]],
+    fields:   ['name', 'party', 'party_type', 'payment_type', 'paid_amount', 'paid_to_account_currency', 'posting_date', 'remarks'],
+    display:  (r) => `${r.payment_type} · ${r.party} · ${r.paid_amount} ${r.paid_to_account_currency} · ${r.posting_date}`,
+  },
+
+  // ── Custom doctypes ────────────────────────────────────────────────────────
+  // Add your custom Frappe doctypes here. Example:
+  //
+  // {
+  //   id:      'my_custom_doc',
+  //   label:   'My Custom Documents',
+  //   doctype: 'My Custom Doctype',          // exact Frappe doctype name
+  //   filters: [['status', '!=', 'Closed']], // Frappe filter syntax
+  //   fields:  ['name', 'title', 'status'],  // fields to fetch
+  //   display: (r) => `${r.title} · ${r.status}`,  // how to format in briefings
+  // },
+];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function relativeDate(days) {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString().split('T')[0];
+}
+
 async function getConnectionConfig(connectionId) {
   try {
     const conn = await backend.getConnection(connectionId);
     if (!conn || conn.status !== 'configured') return null;
-    return conn.config; // decrypted by backend
+    return conn.config;
   } catch {
     return null;
   }
 }
 
-// ── Base Frappe API call ───────────────────────────────────────────────────────
 async function frappeFetch(baseUrl, apiKey, apiSecret, path, options = {}) {
   const res = await fetch(`${baseUrl}${path}`, {
     ...options,
@@ -39,145 +124,90 @@ async function frappeFetch(baseUrl, apiKey, apiSecret, path, options = {}) {
   return res.json();
 }
 
-// ── Generic resource fetcher ───────────────────────────────────────────────────
-async function getResource(config, doctype, filters = [], fields = ['name', 'subject', 'status']) {
+async function fetchDoctype(config, entry, limit = 20) {
   const qs = new URLSearchParams({
-    doctype,
-    fields:  JSON.stringify(fields),
-    filters: JSON.stringify(filters),
-    limit:   50,
+    fields:  JSON.stringify(entry.fields),
+    filters: JSON.stringify(entry.filters),
+    limit,
+    order_by: 'modified desc',
   });
-  return frappeFetch(config.url, config.api_key, config.secret, `/api/resource/${doctype}?${qs}`);
-}
-
-// ── Public connector methods ───────────────────────────────────────────────────
-
-/**
- * Get open projects from a Frappe instance.
- * connectionId comes from the project's connId in the registry.
- */
-export async function getOpenProjects(connectionId) {
-  const config = await getConnectionConfig(connectionId);
-  if (!config) {
-    return { stub: true, message: `ERP connection '${connectionId}' is not configured yet. Add credentials in Settings → Connections.` };
+  try {
+    const data = await frappeFetch(
+      config.url, config.api_key, config.secret,
+      `/api/resource/${encodeURIComponent(entry.doctype)}?${qs}`
+    );
+    return data.data || [];
+  } catch (err) {
+    // Doctype may not exist on this instance — return empty rather than crash
+    console.warn(`[frappe] ${entry.doctype} fetch failed: ${err.message}`);
+    return [];
   }
-
-  const data = await getResource(config, 'Project',
-    [['status', '=', 'Open']],
-    ['name', 'project_name', 'status', 'percent_complete', 'expected_end_date']
-  );
-  return { stub: false, data: data.data || [] };
 }
 
-/**
- * Get open tasks from a Frappe instance for a given project.
- */
-export async function getProjectTasks(connectionId, projectName) {
-  const config = await getConnectionConfig(connectionId);
-  if (!config) {
-    return { stub: true, message: `ERP connection '${connectionId}' is not configured yet.` };
-  }
-
-  const filters = [['project', '=', projectName], ['status', '!=', 'Cancelled']];
-  const data    = await getResource(config, 'Task', filters,
-    ['name', 'subject', 'status', 'priority', 'exp_end_date', 'description']
-  );
-  return { stub: false, data: data.data || [] };
-}
+// ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * Get open sales orders / quotations from a Frappe instance.
- */
-export async function getOpenQuotations(connectionId) {
-  const config = await getConnectionConfig(connectionId);
-  if (!config) {
-    return { stub: true, message: `ERP connection '${connectionId}' is not configured yet.` };
-  }
-
-  const data = await getResource(config, 'Quotation',
-    [['docstatus', '=', 1], ['status', 'not in', ['Ordered', 'Cancelled']]],
-    ['name', 'party_name', 'grand_total', 'currency', 'transaction_date', 'valid_till']
-  );
-  return { stub: false, data: data.data || [] };
-}
-
-/**
- * Get open issues / support tickets.
- */
-export async function getOpenIssues(connectionId) {
-  const config = await getConnectionConfig(connectionId);
-  if (!config) return { stub: true, message: `ERP connection '${connectionId}' is not configured yet.` };
-
-  const data = await getResource(config, 'Issue',
-    [['status', 'not in', ['Resolved', 'Closed']]],
-    ['name', 'subject', 'status', 'priority', 'customer', 'opening_date']
-  );
-  return { stub: false, data: data.data || [] };
-}
-
-/**
- * Get unpaid sales invoices.
- */
-export async function getUnpaidInvoices(connectionId) {
-  const config = await getConnectionConfig(connectionId);
-  if (!config) return { stub: true, message: `ERP connection '${connectionId}' is not configured yet.` };
-
-  const data = await getResource(config, 'Sales Invoice',
-    [['docstatus', '=', 1], ['outstanding_amount', '>', 0]],
-    ['name', 'customer', 'grand_total', 'outstanding_amount', 'currency', 'due_date', 'posting_date']
-  );
-  return { stub: false, data: data.data || [] };
-}
-
-/**
- * Get a full ERP snapshot — open projects, tasks, quotations,
- * invoices and issues in one parallel call.
- * Called once per context build when a connection is configured.
+ * Fetch a full ERP snapshot for a connection.
+ * All registered doctypes are fetched in parallel.
+ * Custom doctypes added to DOCTYPE_REGISTRY are automatically included.
  */
 export async function getERPSnapshot(connectionId) {
   const config = await getConnectionConfig(connectionId);
   if (!config) return { stub: true };
 
-  const safe = async (fn) => { try { return await fn(); } catch { return { data: [] }; } };
+  const results = await Promise.all(
+    DOCTYPE_REGISTRY.map(async (entry) => ({
+      id:    entry.id,
+      label: entry.label,
+      data:  await fetchDoctype(config, entry),
+    }))
+  );
 
-  const [projects, tasks, quotations, invoices, issues] = await Promise.all([
-    safe(() => getResource(config, 'Project',
-      [['status', '=', 'Open']],
-      ['name', 'project_name', 'status', 'percent_complete', 'expected_end_date'])),
-    safe(() => getResource(config, 'Task',
-      [['status', 'not in', ['Cancelled', 'Completed']]],
-      ['name', 'subject', 'status', 'priority', 'project', 'exp_end_date'])),
-    safe(() => getResource(config, 'Quotation',
-      [['docstatus', '=', 1], ['status', 'not in', ['Ordered', 'Cancelled']]],
-      ['name', 'party_name', 'grand_total', 'currency', 'valid_till'])),
-    safe(() => getResource(config, 'Sales Invoice',
-      [['docstatus', '=', 1], ['outstanding_amount', '>', 0]],
-      ['name', 'customer', 'outstanding_amount', 'currency', 'due_date'])),
-    safe(() => getResource(config, 'Issue',
-      [['status', 'not in', ['Resolved', 'Closed']]],
-      ['name', 'subject', 'status', 'priority', 'customer'])),
-  ]);
-
-  return {
-    stub:           false,
-    openProjects:   projects.data   || [],
-    openTasks:      tasks.data      || [],
-    openQuotations: quotations.data || [],
-    unpaidInvoices: invoices.data   || [],
-    openIssues:     issues.data     || [],
-  };
+  // Build result object keyed by doctype id
+  const snapshot = { stub: false };
+  for (const r of results) snapshot[r.id] = r;
+  return snapshot;
 }
 
 /**
- * Create a task in Frappe.
- * Only called when write authorization has been confirmed (Phase 4).
+ * Fetch a single doctype by its registry id.
+ * e.g. fetchOne(connId, 'quotations')
  */
-export async function createFrappeTask(connectionId, taskData) {
+export async function fetchOne(connectionId, doctypeId) {
   const config = await getConnectionConfig(connectionId);
-  if (!config) throw new Error(`ERP connection '${connectionId}' is not configured.`);
+  if (!config) return { stub: true, message: `Connection '${connectionId}' not configured.` };
 
-  return frappeFetch(config.url, config.api_key, config.secret, '/api/resource/Task', {
-    method: 'POST',
-    body:   taskData,
-  });
+  const entry = DOCTYPE_REGISTRY.find(e => e.id === doctypeId);
+  if (!entry) return { stub: true, message: `Doctype '${doctypeId}' not in registry.` };
+
+  const data = await fetchDoctype(config, entry);
+  return { stub: false, label: entry.label, data };
+}
+
+/**
+ * Create a record in Frappe.
+ * Only called after write authorization is confirmed (Phase 4).
+ */
+export async function createRecord(connectionId, doctype, data) {
+  const config = await getConnectionConfig(connectionId);
+  if (!config) throw new Error(`Connection '${connectionId}' not configured.`);
+
+  return frappeFetch(config.url, config.api_key, config.secret,
+    `/api/resource/${encodeURIComponent(doctype)}`,
+    { method: 'POST', body: data }
+  );
+}
+
+/**
+ * Update a record in Frappe.
+ * Only called after write authorization is confirmed (Phase 4).
+ */
+export async function updateRecord(connectionId, doctype, name, data) {
+  const config = await getConnectionConfig(connectionId);
+  if (!config) throw new Error(`Connection '${connectionId}' not configured.`);
+
+  return frappeFetch(config.url, config.api_key, config.secret,
+    `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(name)}`,
+    { method: 'PUT', body: data }
+  );
 }
