@@ -21,12 +21,11 @@ async function getConnectionConfig(connectionId) {
 
 // ── Base Frappe API call ───────────────────────────────────────────────────────
 async function frappeFetch(baseUrl, apiKey, apiSecret, path, options = {}) {
-  const credentials = Buffer.from(`${apiKey}:${apiSecret}`).toString('base64');
   const res = await fetch(`${baseUrl}${path}`, {
     ...options,
     headers: {
       'Content-Type':  'application/json',
-      'Authorization': `Basic ${credentials}`,
+      'Authorization': `token ${apiKey}:${apiSecret}`,
       ...options.headers,
     },
     body: options.body ? JSON.stringify(options.body) : undefined,
