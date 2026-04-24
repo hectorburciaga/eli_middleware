@@ -7,6 +7,8 @@ import { requireAuth }    from './middleware/auth.js';
 import orchestrateRoutes  from './routes/orchestrate.js';
 import authRoutes         from './routes/auth.js';
 import erpRoutes          from './routes/erp.js';
+import analyticsRoutes    from './routes/analytics.js';
+import metabaseRoutes     from './routes/metabase.js';
 
 const PORT    = process.env.PORT    || 3002;
 const ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',').map(s => s.trim());
@@ -42,6 +44,8 @@ app.use('/auth', authRoutes);          // POST /auth/token
 // ── Protected routes ──────────────────────────────────────────────────────────
 app.use('/orchestrate', requireAuth, orchestrateRoutes);
 app.use('/erp',         requireAuth, erpRoutes);
+app.use('/analytics',   requireAuth, analyticsRoutes);
+app.use('/metabase',    requireAuth, metabaseRoutes);
 // POST /orchestrate/chat
 // POST /orchestrate/briefing
 // POST /orchestrate/ingest

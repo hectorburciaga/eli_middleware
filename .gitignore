@@ -11,3 +11,4 @@ node_modules/
 site_config.json
 EOF
 .env
+src/.DS_Store

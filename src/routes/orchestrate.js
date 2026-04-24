@@ -2,6 +2,8 @@ import { Router }       from 'express';
 import Anthropic        from '@anthropic-ai/sdk';
 import { buildContext, buildSystemPrompt } from '../lib/context.js';
 import { executeAction } from '../lib/actions.js';
+import { listQuestions, runQuestion, searchQuestions } from '../tools/metabase.js';
+import * as backend from '../lib/backendClient.js';
 
 const router  = Router();
 const claude  = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -41,13 +43,70 @@ router.post('/chat', async (req, res) => {
     const system = buildSystemPrompt(ctx);
     const iLang  = ctx.settings?.interactionLang || 'en';
 
-    // 2. Assemble message history + new message
+    // 2. Detect analytics intent — search and run relevant Metabase questions
+    let analyticsContext = '';
+    const msg = message.toLowerCase();
+    const analyticsKeywords = [
+      'pipeline', 'monthly', 'this month', 'last month', 'how much', 'total',
+      'revenue', 'sales', 'purchases', 'invoices', 'outstanding', 'overdue',
+      'quotation', 'quote', 'order', 'report', 'summary', 'breakdown', 'trend',
+      'este mes', 'mes pasado', 'cuánto', 'ventas', 'compras', 'cotizaciones',
+      'reporte', 'resumen', 'factura', 'pendiente',
+    ];
+    const needsAnalytics = analyticsKeywords.some(k => msg.includes(k));
+
+    if (needsAnalytics) {
+      try {
+        const connections = ctx.connections;
+        const mbConn      = connections.find(c => c.typeId === 'metabase' && c.status === 'configured');
+
+        if (mbConn) {
+          // Search for questions relevant to the user's message
+          const searchTerms = msg.split(' ').filter(w => w.length > 4).slice(0, 3).join(' ');
+          const found       = await searchQuestions(mbConn.id, searchTerms);
+          const topQuestions= (found.questions || []).slice(0, 5);
+
+          if (topQuestions.length) {
+            // Run the top 3 most relevant questions in parallel
+            const runs = await Promise.allSettled(
+              topQuestions.slice(0, 3).map(q => runQuestion(mbConn.id, q.id).then(r => ({ ...r, name: q.name, description: q.description })))
+            );
+
+            const lines = ['\n\n## Metabase analytics (live data)'];
+            for (const r of runs) {
+              if (r.status !== 'fulfilled' || r.value.stub) continue;
+              const { name, description, cols, rows, summary } = r.value;
+              lines.push(`\n### ${name}${description ? '\n' + description : ''}`);
+              lines.push(summary);
+              if (cols?.length && rows?.length) {
+                lines.push(cols.join(' | '));
+                lines.push(cols.map(() => '---').join(' | '));
+                rows.slice(0, 20).forEach(row => lines.push(cols.map(c => String(row[c] ?? '')).join(' | ')));
+                if (rows.length > 20) lines.push(`_...and ${rows.length - 20} more rows_`);
+              }
+            }
+
+            // Also list other available questions so Claude knows what else exists
+            if (topQuestions.length > 3) {
+              lines.push('\n**Other available questions:**');
+              topQuestions.slice(3).forEach(q => lines.push(`  - [${q.id}] ${q.name}`));
+            }
+
+            analyticsContext = lines.join('\n');
+          }
+        }
+      } catch (err) {
+        console.warn('[orchestrate/chat] Metabase analytics fetch failed:', err.message);
+      }
+    }
+
+    // 3. Assemble message history + new message (with analytics appended if present)
     const messages = [
       ...history.map(h => ({ role: h.role, content: h.content })),
-      { role: 'user', content: message.trim() },
+      { role: 'user', content: message.trim() + analyticsContext },
     ];
 
-    // 3. Call Claude
+    // 4. Call Claude
     const response = await claude.messages.create({
       model:      MODEL,
       max_tokens: 1024,
@@ -57,10 +116,10 @@ router.post('/chat', async (req, res) => {
 
     const raw = response.content?.[0]?.text || '';
 
-    // 4. Execute any action Claude decided on
+    // 5. Execute any action Claude decided on
     const { display, actionResult } = await executeAction(raw, iLang);
 
-    // 5. Return
+    // 6. Return
     res.json({
       reply:        display,
       actionResult: actionResult || null,
