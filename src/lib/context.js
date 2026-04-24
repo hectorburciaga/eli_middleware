@@ -48,7 +48,62 @@ function formatERPSection(erpData) {
   return lines.join('\n');
 }
 
-export function buildSystemPrompt(ctx) {
+export function buildSystemPrompt(ctx, enabledModels = []) {
+  const iLang = ctx.settings?.interactionLang || process.env.USER_INTERACTION_LANG || 'en';
+  const oLang = ctx.settings?.outputLang      || process.env.USER_OUTPUT_LANG      || 'es';
+  const name  = process.env.USER_NAME         || 'Hector';
+  const tz    = process.env.USER_TIMEZONE     || 'America/Monterrey';
+  const about = process.env.USER_CONTEXT      || '';
+
+  const projectList = ctx.projects.map(p => {
+    const conn    = ctx.connections.find(c => c.id === p.connId);
+    const hasERP  = ctx.erpData?.[p.id] ? ' ✓ ERP live' : '';
+    return `  - ${p.id}: ${p.name}${conn ? ` [${conn.label} · ${conn.typeId}${hasERP}]` : ' [no connection]'}`;
+  }).join('\n');
+
+  const { summary } = ctx;
+  const urgentCount   = summary?.counts?.filter(r => r.priority === 'Urgent').reduce((a, r) => a + r.count, 0) || 0;
+  const overdueCount  = summary?.overdue?.length || 0;
+  const dueTodayCount = summary?.dueToday?.length || 0;
+
+  const erpSection      = formatERPSection(ctx.erpData || {});
+  const metabaseSection = enabledModels.length
+    ? `## Metabase analytics tool\nYou have access to the query_metabase tool. Available questions:\n${
+        enabledModels.map(m => `  - id:${m.questionId} "${m.label}"${m.description ? ' — ' + m.description : ''}`).join('\n')
+      }\nCall this tool when the user asks for reports, analytics, trends, or any data insight that one of these questions would answer.`
+    : '## Metabase\nNo analytics models are enabled. The user can add them in Settings → Metabase Models.';
+
+  return `You are the personal AI assistant of ${name}. ${about}
+
+## Language rules
+- Interaction language: ${iLang === 'es' ? 'Spanish' : 'English'}. Always reply to ${name} in this language.
+- Output/deliverable language: ${oLang === 'es' ? 'Spanish' : 'English'}. Use this when drafting documents or deliverables.
+
+## Timezone
+${tz}. Today is ${new Date().toLocaleDateString(iLang === 'es' ? 'es-MX' : 'en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: tz })}.
+
+## Projects
+${projectList || '  (none configured)'}
+
+## Task manager snapshot
+- Urgent:      ${urgentCount}
+- Overdue:     ${overdueCount}
+- Due today:   ${dueTodayCount}
+- Total active:${ctx.tasks.length}
+
+## Active tasks (JSON)
+${JSON.stringify(ctx.tasks, null, 2)}
+
+${erpSection ? `## Live ERP data\n${erpSection}` : '## ERP data\nNo ERP connections configured.'}
+
+${metabaseSection}
+
+## Task management tool
+Use the manage_task tool to create, update, or delete tasks when ${name} requests it.
+
+## Tone
+Concise and direct. Most urgent first. 3-4 sentences max unless a full summary is requested.`;
+}
   const iLang = ctx.settings?.interactionLang || process.env.USER_INTERACTION_LANG || 'en';
   const oLang = ctx.settings?.outputLang      || process.env.USER_OUTPUT_LANG      || 'es';
   const name  = process.env.USER_NAME         || 'Hector';

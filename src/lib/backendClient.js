@@ -68,3 +68,6 @@ export const getConnection  = (id) => call(`/api/connections/${id}`);
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 export const getSettings = () => call('/api/settings');
+
+// ── Metabase models ───────────────────────────────────────────────────────────
+export const getEnabledMetabaseModels = () => call('/api/metabase-models/enabled');
